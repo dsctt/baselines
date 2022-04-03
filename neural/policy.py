@@ -1,151 +1,87 @@
-from pdb import set_trace as T
-import numpy as np
+"""
+Example of making a simple custom policy for NMMO using RLlib.
+For more info, see: https://docs.ray.io/en/latest/rllib/rllib-concepts.html
+"""
+from typing import Dict, List, Type, Union
 
 import torch
-from torch import nn
-from torch.nn.utils import rnn
+import ray
+from ray.rllib.agents.trainer import Trainer
+from ray.rllib.agents.pg.utils import post_process_advantages
+from ray.rllib.evaluation.postprocessing import Postprocessing
+from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
+from ray.rllib.models.modelv2 import ModelV2
+from ray.rllib.policy import Policy
+from ray.rllib.policy.policy_template import build_policy_class
+from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.utils.typing import TensorType
 
-from neural import io, subnets
 
-class Base(nn.Module):
-   def __init__(self, config):
-      '''Base class for baseline policies
+# https://github.com/ray-project/ray/blob/master/rllib/agents/pg/pg_torch_policy.py
+def pg_torch_loss(
+    policy: Policy,
+    model: ModelV2,
+    dist_class: Type[TorchDistributionWrapper],
+    train_batch: SampleBatch,
+) -> Union[TensorType, List[TensorType]]:
+    """The basic policy gradients loss function.
+    Args:
+        policy (Policy): The Policy to calculate the loss for.
+        model (ModelV2): The Model to calculate the loss for.
+        dist_class (Type[ActionDistribution]: The action distr. class.
+        train_batch (SampleBatch): The training data.
+    Returns:
+        Union[TensorType, List[TensorType]]: A single loss tensor or a list
+            of loss tensors.
+    """
+    # Pass the training data through our model to get distribution parameters.
+    dist_inputs, _ = model(train_batch)
 
-      Args:
-         config: A Configuration object
-      '''
-      super().__init__()
-      self.embed  = config.EMBED
-      self.config = config
+    # Create an action distribution object.
+    action_dist = dist_class(dist_inputs, model)
 
-      self.input  = io.Input(config,
-            embeddings=io.MixedEmbedding,
-            attributes=subnets.SelfAttention)
-      self.output = io.Output(config)
+    # Calculate the vanilla PG loss based on:
+    # L = -E[ log(pi(a|s)) * A]
+    log_probs = action_dist.logp(train_batch[SampleBatch.ACTIONS])
 
-      self.valueF = nn.Linear(config.HIDDEN, 1)
+    # Final policy loss.
+    policy_loss = -torch.mean(log_probs * train_batch[Postprocessing.ADVANTAGES])
 
-   def hidden(self, obs, state=None, lens=None):
-      '''Abstract method for hidden state processing, recurrent or otherwise,
-      applied between the input and output modules
+    # Store values for stats function in model (tower), such that for
+    # multi-GPU, we do not override them during the parallel loss phase.
+    model.tower_stats["policy_loss"] = policy_loss
 
-      Args:
-         obs: An observation dictionary, provided by forward()
-         state: The previous hidden state, only provided for recurrent nets
-         lens: Trajectory segment lengths used to unflatten batched obs
-      ''' 
-      raise NotImplementedError('Implement this method in a subclass')
+    return policy_loss
 
-   def forward(self, obs, state=None, lens=None):
-      '''Applies builtin IO and value function with user-defined hidden
-      state subnetwork processing. Arguments are supplied by RLlib
-      ''' 
-      entityLookup  = self.input(obs)
-      hidden, state = self.hidden(entityLookup, state, lens)
-      self.value    = self.valueF(hidden).squeeze(1)
-      actions       = self.output(hidden, entityLookup)
-      return actions, state
 
-class Simple(Base):
-   def __init__(self, config):
-      '''Simple baseline model with flat subnetworks'''
-      super().__init__(config)
-      h = config.HIDDEN
+def pg_loss_stats(policy: Policy, train_batch: SampleBatch) -> Dict[str, TensorType]:
+    """Returns the calculated loss in a stats dict.
+    Args:
+        policy (Policy): The Policy object.
+        train_batch (SampleBatch): The data used for training.
+    Returns:
+        Dict[str, TensorType]: The stats dict.
+    """
 
-      self.ent    = nn.Linear(2*h, h)
-      self.conv   = nn.Conv2d(h, h, 3)
-      self.pool   = nn.MaxPool2d(2)
-      self.fc     = nn.Linear(h*6*6, h)
+    return {
+        "policy_loss": torch.mean(torch.stack(policy.get_tower_stats("policy_loss"))),
+    }
 
-      self.proj   = nn.Linear(2*h, h)
-      self.attend = subnets.SelfAttention(self.embed, h)
 
-   def hidden(self, obs, state=None, lens=None):
-      #Attentional agent embedding
-      agentEmb  = obs['Entity']
-      selfEmb   = agentEmb[:, 0:1].expand_as(agentEmb)
-      agents    = torch.cat((selfEmb, agentEmb), dim=-1)
-      agents    = self.ent(agents)
-      agents, _ = self.attend(agents)
-      #agents = self.ent(selfEmb)
+# Build a child class of `TorchPolicy`, given the extra options:
+# - PG loss function
+# - trajectory post-processing function (to calculate advantages)
+PGTorchPolicy = build_policy_class(
+    name="PGTorchPolicy",
+    framework="torch",
+    get_default_config=lambda: ray.rllib.agents.pg.DEFAULT_CONFIG,
+    loss_fn=pg_torch_loss,
+    stats_fn=pg_loss_stats,
+    postprocess_fn=post_process_advantages,
+)
 
-      #Convolutional tile embedding
-      tiles     = obs['Tile']
-      self.attn = torch.norm(tiles, p=2, dim=-1)
 
-      w      = self.config.WINDOW
-      batch  = tiles.size(0)
-      hidden = tiles.size(2)
-      #Dims correct?
-      tiles  = tiles.reshape(batch, w, w, hidden).permute(0, 3, 1, 2)
-      tiles  = self.conv(tiles)
-      tiles  = self.pool(tiles)
-      tiles  = tiles.reshape(batch, -1)
-      tiles  = self.fc(tiles)
-
-      hidden = torch.cat((agents, tiles), dim=-1)
-      hidden = self.proj(hidden)
-      return hidden, state
-
-class Recurrent(Simple):
-   def __init__(self, config):
-      '''Recurrent baseline model'''
-      super().__init__(config)
-      self.lstm = subnets.BatchFirstLSTM(
-            input_size=config.HIDDEN,
-            hidden_size=config.HIDDEN)
-
-   #Note: seemingly redundant transposes are required to convert between 
-   #Pytorch (seq_len, batch, hidden) <-> RLlib (batch, seq_len, hidden)
-   def hidden(self, obs, state, lens):
-      #Attentional input preprocessor and batching
-      lens = lens.cpu() if type(lens) == torch.Tensor else lens
-      hidden, _ = super().hidden(obs)
-      config    = self.config
-      h, c      = state
-
-      TB  = hidden.size(0) #Padded batch of size (seq x batch)
-      B   = len(lens)      #Sequence fragment time length
-      TT  = TB // B        #Trajectory batch size
-      H   = config.HIDDEN  #Hidden state size
-
-      #Pack (batch x seq, hidden) -> (batch, seq, hidden)
-      hidden        = rnn.pack_padded_sequence(
-                         input=hidden.view(B, TT, H),
-                         lengths=lens,
-                         enforce_sorted=False,
-                         batch_first=True)
-
-      #Main recurrent network
-      hidden, state = self.lstm(hidden, state)
-
-      #Unpack (batch, seq, hidden) -> (batch x seq, hidden)
-      hidden, _     = rnn.pad_packed_sequence(
-                         sequence=hidden,
-                         batch_first=True,
-                         total_length=TT)
-
-      return hidden.reshape(TB, H), state
-
-class Attentional(Base):
-   def __init__(self, config):
-      '''Transformer-based baseline model'''
-      super().__init__(config)
-      self.agents = nn.TransformerEncoderLayer(d_model=config.HIDDEN, nhead=4)
-      self.tiles  = nn.TransformerEncoderLayer(d_model=config.HIDDEN, nhead=4)
-      self.proj   = nn.Linear(2*config.HIDDEN, config.HIDDEN)
-
-   def hidden(self, obs, state=None, lens=None):
-      #Attentional agent embedding
-      agents    = self.agents(obs[Stimulus.Entity])
-      agents, _ = torch.max(agents, dim=-2)
-
-      #Attentional tile embedding
-      tiles     = self.tiles(obs[Stimulus.Tile])
-      self.attn = torch.norm(tiles, p=2, dim=-1)
-      tiles, _  = torch.max(tiles, dim=-2)
-
-      
-      hidden = torch.cat((tiles, agents), dim=-1)
-      hidden = self.proj(hidden)
-      return hidden, state
+# Create a new Trainer using the Policy defined above.
+class CustomTrainer(Trainer):
+    def get_default_policy_class(self, config):
+        return PGTorchPolicy

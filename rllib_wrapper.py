@@ -17,7 +17,8 @@ from ray.rllib.models.torch.recurrent_net import RecurrentNetwork
 
 import nmmo
 
-from neural.policy import Recurrent
+from neural.model import Recurrent
+from neural.policy import CustomTrainer
 from scripted import baselines
 
 class RLlibPolicy(RecurrentNetwork, nn.Module):
@@ -271,16 +272,21 @@ class Trainer:
 
 def PPO(config):
    class PPO(Trainer, rllib.agents.ppo.ppo.PPOTrainer): pass
-   extra_config = {'sgd_minibatch_size': config.SGD_MINIBATCH_SIZE}
+   extra_config = {'sgd_minibatch_size': config.SGD_MINIBATCH_SIZE,
+                   'num_sgd_iter': config.NUM_SGD_ITER,}
    return PPO, extra_config
 
 def APPO(config):
    class APPO(Trainer, rllib.agents.ppo.appo.APPOTrainer): pass
-   return APPO, {}
+   return APPO, {'num_sgd_iter': config.NUM_SGD_ITER,}
 
 def Impala(config):
    class Impala(Trainer, rllib.agents.impala.impala.ImpalaTrainer): pass
-   return Impala, {}
+   return Impala, {'num_sgd_iter': config.NUM_SGD_ITER,}
+
+def CustomPolicy(config):
+   class CustomPolicy(Trainer, CustomTrainer): pass
+   return CustomPolicy, {}
 
 ###############################################################################
 ### Logging

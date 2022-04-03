@@ -87,7 +87,6 @@ def run_tune_experiment(config, trainer_wrapper, rllib_env=wrapper.RLlibEnv):
       'simple_optimizer': True,
       'train_batch_size': config.TRAIN_BATCH_SIZE,
       'rollout_fragment_length': config.ROLLOUT_FRAGMENT_LENGTH,
-      'num_sgd_iter': config.NUM_SGD_ITER,
       'framework': 'torch',
       'horizon': np.inf,
       'soft_horizon': False, 
