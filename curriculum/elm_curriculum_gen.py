@@ -1,23 +1,32 @@
-from typing import Optional, Union
-from dataclasses import dataclass, field
-
 import re
 import wandb
 import random
 import argparse
+import requests
 import numpy as np
+from typing import Optional, Union, List
+from dataclasses import dataclass, field
 
+import nmmo
+from nmmo.core.config import Config as GameConfig
+from nmmo.task.task_api import Task
+from nmmo.task.scenario import Scenario
 
 from openelm import ELM
 from openelm.configs import ELMConfig, PromptModelConfig, EnvConfig, MAPElitesConfig
 from openelm.environments import BaseEnvironment, Genotype, ENVS_DICT
 from openelm.mutation_model import DiffModel
+from openelm.utils.code_eval import pool_exec_processes
+from openelm.sandbox.server.sandbox_codex_execute import ExecResult
 
 from transformers import AutoTokenizer
 
-from sample_tasks import uniq_predicates, tasks, import_str
+from sample_tasks import uniq_predicates, tasks, import_str, task_import_str, task_prompt_str, task_instruction, task_preamble
+
+from scripted import baselines
 
 tokenizer = AutoTokenizer.from_pretrained("Salesforce/codegen-2B-mono")
+Phenotype = Optional[np.ndarray]
 
 @dataclass
 class NMMOConfig(EnvConfig):
@@ -38,48 +47,14 @@ class NMMOConfig(EnvConfig):
     crossover: bool = False
     batch_size: int = 1
     mutate: bool = False
+    game_config: GameConfig = None
 
-# optional code to improve task quality
-# class MockRealm:
-#   def __init__(self):
-#     self.config = nmmo.config.Default()
-#     self.config.PLAYERS = range(100)
-#     self.datastore = NumpyDatastore()
-#     self.items={}
-#     self.datastore.register_object_type("Entity", EntityState.State.num_attributes)
-#     self.datastore.register_object_type("Item", ItemState.State.num_attributes)
-
-Phenotype = Optional[np.ndarray]
 class NMMOTask(Genotype):
     """A task in the NMMO environment."""
-    def __init__(self, program_str: str, impr: str = None):
+    def __init__(self, program_str: str, result_obj: List[Task]):
 
-        # remove the prompt from the program_str
-        program_str = program_str.replace(impr, "")
-        # extract def task_ from the program_str
-        split = program_str.split("\n")
-        task = []
-        for lines in split[::-1]:
-            if lines.startswith("def task_"):
-                task.append(lines)
-                break
-            task.append(lines)
-
-        program_str = "\n".join(task[::-1])
-        # print("Program_str at init")
-        # print(program_str)
-
-        # to check if the task is valid
-        if self.check_valid(program_str):
-            self.valid = True
-            self.program_str: str = re.sub(r" +#.*\n", "", program_str)
-            # need to ignore comments
-            self.morphology = {}
-            self.morphology["predicates"] = self._count_predicates(program_str) 
-            self.morphology["length"] = len(program_str)/100
-            self.morphology["lines"] = program_str.count(r"\n")
-        else:
-            self.valid = False
+        self.program_str = program_str
+        self.result_obj = result_obj
 
     def evaluate(self) -> float:
         # how to evaluate the fitness of a task? (time taken for the baseline RL algo to solve?)
@@ -88,16 +63,6 @@ class NMMOTask(Genotype):
 
         return self._fitness
     
-    def check_valid(self, program_str: str):
-        # additional checks if tasks are correct
-        # if program_str has more than 2048 tokens the tasks is not valid
-        
-        tokens = len(tokenizer(program_str)["input_ids"])
-        if tokens >= 2048:
-            return False
-        
-        return True
-
     def __str__(self) -> str:
         return self.program_str
     
@@ -144,74 +109,76 @@ class NMMO(BaseEnvironment[NMMOTask]):
         self.impr = config.impr
         self.init_prompt = config.init_prompt
 
+    def get_rng_state(self) -> Optional[np.random._generator.Generator]:
+        return None
+    
+    def set_rng_state(self, rng_state: Optional[np.random._generator.Generator]):
+        pass
+
     def construct_prompt(
         self, code_batch: Optional[Union[list[str], str]] = None
     ) -> dict[str, str]:
         
-        import_s = self.impr
-        prompt_str = import_s
+        prompt_str = task_import_str
 
-        if self.config.mutate and code_batch is not None:
-            # add prev task to the prompt if mutate is true
-            if isinstance(code_batch, list):
-                prompt_str += "\n"+code_batch[0]
-            elif isinstance(code_batch, str):
-                prompt_str += "\n"+code_batch 
-        else:
-            prompt_str += "\n"+self.init_prompt
+        # if self.config.mutate and code_batch is not None:
+        #     # add prev task to the prompt if mutate is true
+        #     if isinstance(code_batch, list):
+        #         prompt_str += "\n"+code_batch[0]
+        #     elif isinstance(code_batch, str):
+        #         prompt_str += "\n"+code_batch 
+        # else:
+        #     prompt_str += "\n"+self.init_prompt
+
+        prompt_str += f'\n\n{task_instruction}\n\n{task_prompt_str}\n\n{task_preamble}'
             
         # instruction postpended to the prompt
-        inst = "\n# use the predicates listed in the imports and complete the task using diverse predicates than before\ndef task_"
-        import_s += inst
-        prompt_str += inst
-        return {"prompt": prompt_str, "template": import_s}
+        # inst = "\n# use the predicates listed in the imports and complete the task using diverse predicates than before\ndef task_"
+        # import_s += inst
+        # prompt_str += inst
 
-    # NMMOTask should only contain the task, after the prompt
+        print('PROOOOMPT', prompt_str)
+        return {"prompt": prompt_str, "template": f'{task_import_str}\n\n{task_preamble}'}
+
     def generate_programs(self, code_batch: list[dict[str, str]]) -> list[NMMOTask]:
         
         local_scope_exec: bool = False
         
-        generated_tasks = self.mutation_model.generate_programs(
-            code_batch, local_scope_exec
+        generated_programs = self.mutation_model.generate_programs(
+            code_batch, local_scope_exec, do_trunc = False
         )
 
-        # check if each task is valid then append to the list
-        task_list = []
-        for t in generated_tasks:
-            task = NMMOTask(t, self.impr)
-            if task.valid:
-                task_list.append(task)
+        # Truncate
+        for i, gp in enumerate(generated_programs):
+            ret_line = 'return scenario.tasks'
+            i_return = gp.find(ret_line)
+            generated_programs[i] = gp[:i_return+len(ret_line)].strip()
 
-        return task_list
-        # code to check the validity of the task, commented out to speed up the process
-        # for task in generated_tasks:
-        #     with open("generated_progam.py","a") as f:
-        #         f.write(task)
-        # realm = MockRealm()
-        # entity_id = 123
-        # population_id = 11
-        # entity = Entity(realm, (10,20), entity_id, "name", "color", population_id)
+        for gp in generated_programs:
+            print('COOOOODE', gp)
+        
+        # TODO: add sandbox option
+        results = pool_exec_processes(
+            generated_programs,
+            func_name="new_task_4",
+            args={
+                'scenario': Scenario(self.config.game_config)
+            },
+            timeout=self.config.timeout,
+            processes=self.config.processes,
+            debug=self.config.debug,
+        )
 
+        results = [{'program_str': gen_prog, 'result_obj': res_obj}
+                    for (gen_prog, res_obj) in zip(generated_programs, results)]
+        return [NMMOTask(**p) for p in results]
 
-        # results = pool_exec_processes(
-        #     generated_tasks,
-        #     timeout=5.0,
-        #     args={"entity":entity},
-        #     debug=False
-        # )
-        # result_list: list = []
-        # for i, result in enumerate(results):
-        #     try:
-        #         if isinstance(result, AND) or isinstance(result, OR) or isinstance(result, Predicate): 
-        #             print(generated_tasks[i])
-        #             result_list.append(generated_tasks[i])
-        #     except Exception as e:
-        #         print(type(e))
-
-    # Executed First
     def random(self) -> list[NMMOTask]:
-        program_list = [self.construct_prompt() for _ in range(2)]
+        program_list = [self.construct_prompt() for _ in range(self.batch_size)]
         new_tasks = self.generate_programs(program_list)
+        for t in new_tasks:
+            print("###########NEW TASKSSS", t.result_obj)
+            print(t.program_str)
         return new_tasks
 
     def mutate(self, x: list[NMMOTask]) -> list[NMMOTask]:
@@ -220,12 +187,32 @@ class NMMO(BaseEnvironment[NMMOTask]):
         new_tasks = self.generate_programs(program_list)
         return new_tasks
 
-    def fitness(self, x: NMMOTask) -> float:
-        if x.valid:
-            return x.evaluate()
-        else:
+    def fitness(self, task: NMMOTask) -> float:
+        raise Exception
+        if isinstance(task.result_obj, ExecResult):
+            print('BAAAAAAAD!!!!!!!!!!!')
             return -np.inf
 
+        print('GOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOD')
+
+        return 0
+
+# tmp test config
+class ScriptedAgentTestConfig(nmmo.config.Small, nmmo.config.AllGameSystems):
+  __test__ = False
+
+  LOG_ENV = True
+
+  LOG_MILESTONES = True
+  LOG_EVENTS = False
+  LOG_VERBOSE = False
+
+  SPECIALIZE = True
+  PLAYERS = [
+    baselines.Fisher, baselines.Herbalist,
+    baselines.Prospector,baselines.Carver, baselines.Alchemist,
+    baselines.Melee, baselines.Range, baselines.Mage]
+  
 def main(temperature, imports, n_tasks, model, mutate, batch_size):
 
     impr = import_str[imports]
@@ -237,13 +224,14 @@ def main(temperature, imports, n_tasks, model, mutate, batch_size):
     config.env.init_prompt = prompt_tasks
     config.env.mutate = mutate
     config.env.batch_size = batch_size
+    config.env.game_config = ScriptedAgentTestConfig()
     config.qd = MAPElitesConfig()
     # config.qd.map_grid_size = (20)
     config.model = PromptModelConfig()
     config.model.temp = temperature
     config.model.batch_size = batch_size
     config.batch_size = batch_size
-    config.model.model_path = f"Salesforce/codegen-{model}B-mono"
+    config.model.model_path = f"Salesforce/codegen-{model}-mono"
 
     ENVS_DICT["NMMO"] = NMMO
 
@@ -259,23 +247,24 @@ if __name__ == "__main__":
     args.add_argument("--mutate", action='store_true', default=False, help="include the task output from the LLM in the next gens of prompt or not")
     args.add_argument("--imports", type=str, default="short_import", help="Use a smaller import statement or a larger well-defined one")
     args.add_argument("--n_tasks", type=int, default=2, help="number of sample tasks to use as prompt")
-    args.add_argument("--model", type=int, default=2, help="model size to use, 2B/6B")
-    args.add_argument("--batch_size", type=int, default=4, help="batch size")
+    args.add_argument("--model", type=str, default='2B', help="model size to use, 2B/6B")
+    args.add_argument("--batch_size", type=int, default=8, help="batch size")
     # Deep Speed
     # args.add_argument("--local_rank", type=int, default=0)
     args = args.parse_args()
 
-    wandb.init(
-        project="NMMO-ELM",
-        config=vars(args)
-    )
+    # wandb.init(
+    #     project="NMMO-ELM",
+    #     config=vars(args)
+    # )
 
-    max_fitness, niches, qd, fitnesses = main(args.temperature, args.imports, args.n_tasks, args.model, args.mutate, args.batch_size)
+    # max_fitness, niches, qd, fitnesses = main(args.temperature, args.imports, args.n_tasks, args.model, args.mutate, args.batch_size)
+    main(args.temperature, args.imports, args.n_tasks, args.model, args.mutate, args.batch_size)
 
     # write max fitness niches and qd to file with n_tasks, temperature, model, imports as the file name
-    with open(f"tasks_{args.n_tasks}_{args.temperature}_{args.imports}.txt", "w", encoding="utf-8") as f:
-        f.write(f"max fitness: {max_fitness}\n")
-        f.write(f"niches: {niches}\n")
-        f.write(f"qd: {qd}\n")
-    print(f"Niches filled: {niches}")
-    print(f"QD: {qd}")
+    # with open(f"tasks_{args.n_tasks}_{args.temperature}_{args.imports}.txt", "w", encoding="utf-8") as f:
+    #     f.write(f"max fitness: {max_fitness}\n")
+    #     f.write(f"niches: {niches}\n")
+    #     f.write(f"qd: {qd}\n")
+    # print(f"Niches filled: {niches}")
+    # print(f"QD: {qd}")

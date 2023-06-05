@@ -282,3 +282,78 @@ tasks = ["""def task_BandOfGuildsman(gs: GameState,
     """def task_craft_ammunition(entity: Entity):
         # Task to craft 10 level 2 shards
         return AND(CraftItem(item.Shard, level=2, quantity=10))"""]
+
+task_import_str = '''import nmmo
+import nmmo.task.task_api as t
+import nmmo.systems.skill as skill
+from nmmo.task.game_state import GameState
+from nmmo.task.scenario import Scenario
+from nmmo.task.base_predicates import TickGE, DistanceTraveled, AttainSkill, HoardGold, EarnGold, SpendGold, MakeProfit
+
+class Tier:
+    REWARD_SCALE = 15
+    EASY         = 4 / REWARD_SCALE
+    NORMAL       = 6 / REWARD_SCALE
+    HARD         = 11 / REWARD_SCALE'''
+
+task_prompt_str = '''# Define a new predicate by combining base_predicates and other new predicates in a different way
+@t.define_predicate
+def new_predicate_1(gs: GameState, subject: Group, amount: int):
+    return t.OR(HoardGold(subject, amount),
+                EarnGold(subject, amount),
+                SpendGold(subject, amount),
+                MakeProfit(subject, amount))
+
+def new_task_1(scenario: Scenario):
+  scenario.add_tasks(new_predicate_1(amount=20)*Tier.EASY, groups='teams')
+  scenario.add_tasks(new_predicate_1(amount=30)*Tier.NORMAL, groups='teams')
+  scenario.add_tasks(new_predicate_1(amount=60)*Tier.HARD, groups='teams')
+  return scenario.tasks
+
+# Define a new predicate by combining base_predicates and other new predicates in a different way
+@t.define_predicate
+def new_predicate_2(gs: GameState, subject: Group, lvl: int, num_agent: int):
+    return t.OR(AttainSkill(subject, skill.Fishing, lvl, num_agent),
+                AttainSkill(subject, skill.Herbalism, lvl, num_agent),
+                AttainSkill(subject, skill.Prospecting, lvl, num_agent),
+                AttainSkill(subject, skill.Carving, lvl, num_agent),
+                AttainSkill(subject, skill.Alchemy, lvl, num_agent))
+
+# Add new tasks by using the new predicate with different parameters
+def new_task_2(scenario: Scenario):
+  scenario.add_tasks(new_predicate_2(lvl=2, num_agent=1)*Tier.EASY, groups='teams')
+  scenario.add_tasks(new_predicate_2(lvl=2, num_agent=2)*Tier.NORMAL, groups='teams')
+  scenario.add_tasks(new_predicate_2(lvl=2, num_agent=4)*Tier.HARD, groups='teams')
+  return scenario.tasks
+
+# Define a new predicate by combining base_predicates and other new predicates in a different way
+@t.define_predicate
+def new_predicate_3(gs: GameState, subject: Group, skill_lvl: int, amount: int, num_agent: int, num_tick: int, dist: int):
+    return t.OR(AttainSkill(subject, skill.Alchemy, skill_lvl, num_agent),
+                EarnGold(subject, amount),
+                TickGE(subject, num_tick),
+                DistanceTraveled(subject, dist))
+
+# Add new tasks by using the new predicate with different parameters
+def new_task_3(scenario: Scenario):
+  scenario.add_tasks(new_predicate_3(skill_lvl=2, num_agent=1, num_tick=350, dist=12)*Tier.EASY, groups='teams')
+  scenario.add_tasks(new_predicate_3(skill_lvl=5, num_agent=1, num_tick=600, dist=64)*Tier.NORMAL, groups='teams')
+  scenario.add_tasks(new_predicate_3(skill_lvl=7, num_agent=1, num_tick=1400, dist=200)*Tier.HARD, groups='teams')
+  return scenario.tasks'''
+
+task_instruction = '''"""
+Use the following function parameters for the imported base_predicates:
+TickGE(num_tick: int)
+DistanceTraveled(subject: Group, dist: int)
+HoardGold(subject: Group, amount: int)
+EarnGold(subject: Group, amount: int)
+SpendGold(subject: Group, amount: int)
+MakeProfit(subject: Group, amount: int)
+AttainSkill(subject: Group, skill: Skill, level: int, num_agent: int)
+
+Use the following Skill types: skill.Melee, skill.Mage, skill.Range, skill.Water, skill.Food, skill.Fishing, skill.Herbalism, skill.Prospecting, skill.Alchemy, skill.Carving
+"""'''
+
+task_preamble ='''# Define a new predicate by combining base_predicates and other new predicates in a different way
+@t.define_predicate
+def new_predicate_4(gs, subject, '''
