@@ -4,16 +4,17 @@ from typing import Tuple
 
 import nmmo
 import nmmo.task.task_api as t
-import nmmo.task.base_predicates as p
+import nmmo.task.predicate_api as p
+import nmmo.task.base_predicates as bp
 from nmmo.task import constraint
 from nmmo.core.config import Config
 from nmmo.core.env import Env as TaskEnv
-from nmmo.task.scenario import Scenario
 
 from scripted import baselines
 
 """
-Script to heuristically generate and save baseline tasks for 2023 NeurIPS competition.
+Script to generate and save baseline tasks for 2023 NeurIPS competition.
+Uses heuristic shaping with random parameter generation.
 The default args in this script are the ones used to generate the competition baseline tasks.
 """
 # TODO: type hints
@@ -130,32 +131,34 @@ class HeuristicTaskGenerator:
         item = constraint.ITEM_CONSTRAINT
         inventory_cap = constraint.INVENTORY_CONSTRAINT
         consumable = constraint.CONSUMABLE_CONSTRAINT
+        event_count = constraint.EVENT_NUMBER_CONSTRAINT
+        gold_amount = constraint.GOLD_CONSTRAINT
 
         gen = RandomTaskInfoGenerator(self.config)
-        gen.add_pred_spec(p.TickGE, [N])
-        gen.add_pred_spec(p.CanSeeTile, [tile_type])
-        gen.add_pred_spec(p.StayAlive, [])
-        gen.add_pred_spec(p.AllDead, []) # TODO: should this predicate have a "target" param?
-        gen.add_pred_spec(p.OccupyTile, [coord, coord])
-        gen.add_pred_spec(p.AllMembersWithinRange, [coord])
-        gen.add_pred_spec(p.CanSeeAgent, [agent])
-        gen.add_pred_spec(p.CanSeeGroup, [group])
-        gen.add_pred_spec(p.DistanceTraveled, [N]) # TODO: should this param be COORDINATE_CONSTRAINT?
-        gen.add_pred_spec(p.AttainSkill, [skill, level, agent])
-        gen.add_pred_spec(p.CountEvent, [event, N])
-        gen.add_pred_spec(p.ScoreHit, [combat_style, N])
-        gen.add_pred_spec(p.HoardGold, [N])
-        gen.add_pred_spec(p.EarnGold, [N])
-        gen.add_pred_spec(p.SpendGold, [N])
-        gen.add_pred_spec(p.MakeProfit, [N])
-        gen.add_pred_spec(p.InventorySpaceGE, [N]) # TODO: should this param be INVENTORY_CONSTRAINT?
-        gen.add_pred_spec(p.OwnItem, [item, level, inventory_cap])
-        gen.add_pred_spec(p.EquipItem, [item, level, agent])
-        gen.add_pred_spec(p.FullyArmed, [combat_style, level, agent])
-        gen.add_pred_spec(p.ConsumeItem, [consumable, level, N])
-        gen.add_pred_spec(p.HarvestItem, [item, level, N])
-        gen.add_pred_spec(p.ListItem, [item, level, N])
-        gen.add_pred_spec(p.BuyItem, [item, level, N])
+        gen.add_pred_spec(bp.TickGE, [N])
+        gen.add_pred_spec(bp.CanSeeTile, [tile_type])
+        gen.add_pred_spec(bp.StayAlive, [])
+        gen.add_pred_spec(bp.AllDead, [])
+        gen.add_pred_spec(bp.OccupyTile, [coord, coord])
+        gen.add_pred_spec(bp.AllMembersWithinRange, [coord])
+        gen.add_pred_spec(bp.CanSeeAgent, [agent])
+        gen.add_pred_spec(bp.CanSeeGroup, [group])
+        gen.add_pred_spec(bp.DistanceTraveled, [N])
+        gen.add_pred_spec(bp.AttainSkill, [skill, level, agent])
+        gen.add_pred_spec(bp.CountEvent, [event, event_count])
+        gen.add_pred_spec(bp.ScoreHit, [combat_style, event_count])
+        gen.add_pred_spec(bp.HoardGold, [gold_amount])
+        gen.add_pred_spec(bp.EarnGold, [gold_amount])
+        gen.add_pred_spec(bp.SpendGold, [gold_amount])
+        gen.add_pred_spec(bp.MakeProfit, [gold_amount])
+        gen.add_pred_spec(bp.InventorySpaceGE, [inventory_cap])
+        gen.add_pred_spec(bp.OwnItem, [item, level, inventory_cap])
+        gen.add_pred_spec(bp.EquipItem, [item, level, agent])
+        gen.add_pred_spec(bp.FullyArmed, [combat_style, level, agent])
+        gen.add_pred_spec(bp.ConsumeItem, [consumable, level, event_count])
+        gen.add_pred_spec(bp.HarvestItem, [item, level, event_count])
+        gen.add_pred_spec(bp.ListItem, [item, level, event_count])
+        gen.add_pred_spec(bp.BuyItem, [item, level, event_count])
 
         task_infos = []
         for _ in range(n):
@@ -223,16 +226,11 @@ class ScriptedAgentTestConfig(nmmo.config.Small, nmmo.config.AllGameSystems):
     baselines.Prospector,baselines.Carver, baselines.Alchemist,
     baselines.Melee, baselines.Range, baselines.Mage]
 
-def test_rollout(tasks):
-    # Test rollout with each task
-    # Each task_info corresponds to one task
-    for task in tasks:
-        env = TaskEnv(config)
-        scenario = Scenario(config)
-        scenario.add_tasks(task)
-        env.change_task(scenario.tasks)
-        for _ in range(30):
-            env.step({})
+def rollout(env, tasks, steps=30):
+    env.reset(make_task_fn=lambda: tasks)
+    for _ in range(steps):
+        env.step({})
+    return env.step({})
 
 if __name__ == '__main__':
     # TODO: put necessary things as args
@@ -249,4 +247,7 @@ if __name__ == '__main__':
     #   and add command line arg to evaluate tasks from load for demo
 
     # Test run tasks to see if they "compile" in the environment
-    test_rollout(tasks)
+    env = TaskEnv(config)
+    rollout(env, tasks)
+
+    # TODO: if some tasks are invalid, re-generate and replace them
